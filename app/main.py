@@ -19,13 +19,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
         "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
         "已通过申请的改期（原子重选授权）、"
         "授权退役时将未撤销申请一次性改挂到替代授权；"
-        "并支持 1～30 分钟有效期的发行额度预留（待确认/确认/取消/过期）。"
+        "支持 1～30 分钟有效期的发行额度预留（待确认/确认/取消/过期）；"
+        "并支持额度不足时的通道候补队列（按受理顺序成交/失败/取消）。"
     ),
     lifespan=lifespan,
 )
@@ -228,3 +229,52 @@ def cancel_reservation(
     reservation_id: int, db: Session = Depends(get_db)
 ):
     return services.cancel_reservation(db, reservation_id)
+
+
+# ------------------------------------------------------------------ 候补
+@app.post(
+    "/api/v1/waitlists",
+    response_model=schemas.WaitlistOut,
+    status_code=201,
+    tags=["waitlists"],
+    summary=(
+        "提交候补申请：全部可承接则直接成交；每项均有匹配授权但额度不足"
+        "则入本通道候补队列；缺少匹配授权则逐项拒绝"
+    ),
+)
+def create_waitlist(
+    body: schemas.WaitlistCreate, db: Session = Depends(get_db)
+):
+    return services.create_waitlist(db, body)
+
+
+@app.get(
+    "/api/v1/waitlists",
+    response_model=list[schemas.WaitlistOut],
+    tags=["waitlists"],
+    summary="查询候补列表（可按 status 过滤：待成交/已成交/已失败/已取消）",
+)
+def list_waitlists(
+    status: str | None = None, db: Session = Depends(get_db)
+):
+    return services.list_waitlists(db, status)
+
+
+@app.get(
+    "/api/v1/waitlists/{waitlist_id}",
+    response_model=schemas.WaitlistOut,
+    tags=["waitlists"],
+    summary="查询候补（状态、失败原因及生成的申请编号）",
+)
+def get_waitlist(waitlist_id: int, db: Session = Depends(get_db)):
+    return services.get_waitlist(db, waitlist_id)
+
+
+@app.post(
+    "/api/v1/waitlists/{waitlist_id}/cancel",
+    response_model=schemas.WaitlistOut,
+    tags=["waitlists"],
+    summary="取消待成交候补（仅 pending 可取消；已成交的请撤销其申请）",
+)
+def cancel_waitlist(waitlist_id: int, db: Session = Depends(get_db)):
+    return services.cancel_waitlist(db, waitlist_id)

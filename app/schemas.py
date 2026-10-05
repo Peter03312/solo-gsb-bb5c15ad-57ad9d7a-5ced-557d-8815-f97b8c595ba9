@@ -276,3 +276,46 @@ class ReservationOut(BaseModel):
     items: list[ReservationItemOut] = Field(
         description="逐项命中授权（含确认时的逐项可预留余量快照）"
     )
+
+
+# ----------------------------------------------------------------- 候补
+class WaitlistCreate(DistributionCreate):
+    """候补申请：字段与直接发行申请一致（素材清单/地区/渠道/带时区发行时刻）。
+
+    - 全部可承接：直接生成已通过申请（status=fulfilled，随附申请编号）；
+    - 每项均有匹配授权但额度不足：进入本通道候补队列（status=pending）；
+    - 任一项缺少匹配授权：422 逐项拒绝，不入队。
+    """
+
+
+class WaitlistItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    item_index: int
+    material_id: int
+
+
+class WaitlistOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    region: str
+    channel: str
+    occur_at: datetime
+    # pending=待成交 fulfilled=已成交 failed=已失败（授权不再匹配）
+    # cancelled=已取消。
+    status: Literal["pending", "fulfilled", "failed", "cancelled"]
+    failure_reason: str | None = Field(
+        default=None,
+        description="终态失败原因：no_matching_authorization / authorization_inactive",
+    )
+    distribution_id: int | None = Field(
+        default=None, description="成交后生成的发行申请编号"
+    )
+    created_at: datetime
+    fulfilled_at: datetime | None = None
+    failed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    items: list[WaitlistItemOut] = Field(description="候补素材清单")
+    # 仅在已成交（status=fulfilled）时随附完整申请。
+    distribution: DistributionOut | None = None
