@@ -183,3 +183,70 @@ class InvalidReservationStatus(APIError):
                 "可选 pending/confirmed/cancelled/expired"
             ),
         )
+
+
+# ------------------------------------------------------------------ 候补
+class WaitlistRejected(APIError):
+    """候补受理核验未通过：存在缺少匹配授权的项，整体拒绝、不入队。"""
+
+    def __init__(self, reasons: list[dict]):
+        super().__init__(
+            status_code=422,
+            code="waitlist_rejected",
+            message="候补受理核验未通过：存在缺少匹配授权的素材，未入候补队列",
+            details=reasons,
+        )
+
+
+class WaitlistNotPending(APIError):
+    """对候补执行取消时的状态冲突基类（409）。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(status_code=409, code=code, message=message)
+
+
+class WaitlistAlreadyFulfilled(WaitlistNotPending):
+    """候补已成交转为发行申请：不可取消，需走申请撤销规则。"""
+
+    def __init__(self, waitlist_id: int, distribution_id: int | None):
+        super().__init__(
+            code="waitlist_already_fulfilled",
+            message=(
+                f"候补已成交并转为发行申请（id={distribution_id}），不可取消："
+                f"{waitlist_id}；如需释放额度请撤销该发行申请"
+            ),
+        )
+
+
+class WaitlistAlreadyCancelled(WaitlistNotPending):
+    """重复取消：409，状态不再变化。"""
+
+    def __init__(self, waitlist_id: int):
+        super().__init__(
+            code="waitlist_already_cancelled",
+            message=f"候补已取消，不可重复取消：{waitlist_id}",
+        )
+
+
+class WaitlistAlreadyFailed(WaitlistNotPending):
+    """候补已失败（授权不再匹配）：不可取消。"""
+
+    def __init__(self, waitlist_id: int):
+        super().__init__(
+            code="waitlist_already_failed",
+            message=f"候补已失败（授权已不再匹配），不可取消：{waitlist_id}",
+        )
+
+
+class InvalidWaitlistStatus(APIError):
+    """候补列表查询使用了不支持的状态过滤值。"""
+
+    def __init__(self, value: str):
+        super().__init__(
+            status_code=422,
+            code="invalid_waitlist_status",
+            message=(
+                f"不支持的候补状态：{value}；"
+                "可选 pending/fulfilled/failed/cancelled"
+            ),
+        )

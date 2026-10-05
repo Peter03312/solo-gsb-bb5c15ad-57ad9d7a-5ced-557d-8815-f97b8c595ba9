@@ -276,3 +276,70 @@ class ReservationOut(BaseModel):
     items: list[ReservationItemOut] = Field(
         description="逐项命中授权（含确认时的逐项可预留余量快照）"
     )
+
+
+# ----------------------------------------------------------------- 候补
+class WaitlistCreate(BaseModel):
+    """提交候补申请：与发行申请相同的入参（素材清单/地区/渠道/发行时刻）。"""
+
+    material_ids: list[int] = Field(
+        min_length=1, description="本次申请发行的素材编号（数据库自增 id）"
+    )
+    region: str = Field(min_length=1, max_length=64)
+    channel: str = Field(min_length=1, max_length=64)
+    occur_at: datetime = Field(description="发行时刻（带时区）")
+
+    @field_validator("material_ids")
+    @classmethod
+    def _positive_ids(cls, v: list[int]) -> list[int]:
+        if any(mid <= 0 for mid in v):
+            raise ValueError("素材编号必须为正整数")
+        return v
+
+    @field_validator("region", "channel")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空串")
+        return v
+
+    @field_validator("occur_at")
+    @classmethod
+    def _occur_aware(cls, v: datetime) -> datetime:
+        return _ensure_aware(v, "occur_at")
+
+
+class WaitlistItemOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    item_index: int
+    material_id: int
+
+
+class WaitlistOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    region: str
+    channel: str
+    occur_at: datetime
+    # pending=候补中 fulfilled=已成交转申请 failed=授权不再匹配 cancelled=已取消。
+    status: Literal["pending", "fulfilled", "failed", "cancelled"]
+    failure_reason: str | None = Field(
+        default=None,
+        description="失败原因码（仅 failed 时非空，如 authorization_unavailable）",
+    )
+    failure_details: list[dict] | None = Field(
+        default=None, description="失败逐项明细（与拒绝响应 details 同构）"
+    )
+    distribution_id: int | None = Field(
+        default=None, description="成交后生成的发行申请编号"
+    )
+    # 仅在已成交（status=fulfilled）时随附完整申请。
+    distribution: DistributionOut | None = None
+    created_at: datetime
+    fulfilled_at: datetime | None = None
+    failed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    items: list[WaitlistItemOut] = Field(description="候补素材清单（按提交顺序）")

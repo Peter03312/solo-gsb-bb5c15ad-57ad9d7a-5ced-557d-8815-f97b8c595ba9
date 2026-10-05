@@ -1,17 +1,18 @@
-"""核心业务逻辑：登记 / 核验占用 / 查询 / 撤销 / 改期 / 授权退役改挂 / 额度预留。
+"""核心业务逻辑：登记 / 核验占用 / 查询 / 撤销 / 改期 / 授权退役改挂 /
+额度预留 / 候补受理与队首重算。
 
 并发安全
 ========
 所有通道写事务遵守统一的全局加锁顺序，杜绝跨事务死锁：
 
-    **通道咨询锁（region+channel）→ 到期预留结算 → 预留/申请行 →
-    授权行（id 升序）→ 明细行**
+    **通道咨询锁（region+channel）→ 到期预留结算 → 候补队首重算 →
+    预留/申请/候补行 → 授权行（id 升序）→  明细行**
 
 通道咨询锁按 ``region+channel`` 分桶：同一通道内的提交、预留、确认、
-取消、撤销、改期、改挂全部串行判定。授权行只可能被同通道事务竞争
-（授权匹配维度即 region+channel，改挂也要求两端通道一致），因此不同
-通道的事务不会争用同一授权行，跨桶不可能形成等待环；同事务内对同一批
-授权一律按 id 升序 ``SELECT ... FOR UPDATE``。
+取消、撤销、改期、改挂、候补受理与队首重算全部串行判定。授权行只可能
+被同通道事务竞争（授权匹配维度即 region+channel，改挂也要求两端通道
+一致），因此不同通道的事务不会争用同一授权行，跨桶不可能形成等待环；
+同事务内对同一批授权一律按 id 升序 ``SELECT ... FOR UPDATE``。
 
 到期释放（惰性结算）
 ====================
@@ -20,6 +21,15 @@
 逐项归还 ``reserved_count``。因此预留一旦到期，对随后的提交/预留/余量
 判定立即可见（「到期即释放」）。预留查询（单条）同样先做通道结算，
 故逾期确认/取消必被拒绝。
+
+候补队首重算
+============
+候补条目不持有额度。撤销、预留取消/到期、改期、改挂释放额度后，以及
+新直接申请/新候补受理前，事务在咨询锁内按受理顺序（id 升序）重算本
+通道候补队首：能整体承接则条件占额并生成一笔 approved 申请
+（fulfilled），额度仍不足则停止本轮（队首阻塞），授权已不再匹配则
+标记 failed 并继续后项。重算与触发操作同事务提交，并发释放与受理
+不会重复生成申请、不会超额。
 
 额度模型
 ========
@@ -48,6 +58,7 @@ from app.errors import (
     DistributionRevoked,
     DuplicateMaterialItems,
     InvalidReservationStatus,
+    InvalidWaitlistStatus,
     MigrationRejected,
     MaterialCodeTaken,
     RescheduleRejected,
@@ -58,6 +69,10 @@ from app.errors import (
     ReservationRejected,
     ResourceNotFound,
     UnknownMaterial,
+    WaitlistAlreadyCancelled,
+    WaitlistAlreadyFailed,
+    WaitlistAlreadyFulfilled,
+    WaitlistRejected,
 )
 from app.schemas import (
     AuthorizationCreate,
@@ -66,6 +81,7 @@ from app.schemas import (
     DistributionReschedule,
     MaterialCreate,
     ReservationCreate,
+    WaitlistCreate,
 )
 
 
@@ -124,13 +140,16 @@ def get_authorization(db: Session, authorization_id: int) -> models.Authorizatio
     try:
         _channel_lock(db, auth.region, auth.channel)
         now = utcnow()
-        _settle_expired(
+        _, settled = _settle_expired(
             db,
             now,
             region=auth.region,
             channel=auth.channel,
             extra_auth_ids=[authorization_id],
         )
+        if settled:
+            # 到期释放额度后，按受理顺序重算本通道候补队首。
+            _process_waitlist(db, auth.region, auth.channel)
         db.commit()
     except Exception:
         db.rollback()
@@ -195,8 +214,11 @@ def _settle_expired(
     region: str | None = None,
     channel: str | None = None,
     extra_auth_ids: list[int] | None = None,
-) -> list[models.Authorization]:
-    """在已持有通道咨询锁的前提下，结算到期未确认预留并返回锁定的授权行。
+) -> tuple[list[models.Authorization], int]:
+    """在已持有通道咨询锁的前提下，结算到期未确认预留。
+
+    返回 ``(锁定的授权行, 本次结算的到期预留条数)``；调用方在
+    「到期释放额度」这一触发点据此决定是否重算候补队首。
 
     - 锁定本通道（或全局，列表场景不调用本函数）所有 ``expires_at <= now``
       的待确认预留行（FOR UPDATE）；
@@ -286,7 +308,7 @@ def _settle_expired(
             .order_by(models.Authorization.id.asc())
             .execution_options(populate_existing=True)
         )) if lock_ids else []
-    return locked
+    return locked, len(expiring)
 
 
 def _evaluate(
@@ -411,6 +433,149 @@ def _candidate_auth_ids(
     )
 
 
+def _lock_authorizations(
+    db: Session, auth_ids: list[int]
+) -> list[models.Authorization]:
+    """按 id 升序行锁指定授权并返回最新行。
+
+    ``populate_existing`` 保证读到行锁保护下的真实计数：同事务内此前的
+    条件 UPDATE（撤销/改期/改挂/候补占额等 Core 更新）绕过 ORM，会话中
+    的同 id 对象可能仍是旧值。
+    """
+    if not auth_ids:
+        return []
+    return list(
+        db.scalars(
+            select(models.Authorization)
+            .where(models.Authorization.id.in_(sorted(set(auth_ids))))
+            .order_by(models.Authorization.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+
+
+# ----------------------------------------------------------------- 候补
+# 重算时「授权已不再匹配」的逐项原因（无匹配授权，或匹配授权均已停用）。
+_NO_MATCH_REASONS = ("no_matching_authorization", "authorization_inactive")
+
+
+def _occupy_waitlist(
+    db: Session,
+    head: models.WaitlistRequest,
+    items: list[models.WaitlistItem],
+    chosen: dict[int, models.Authorization],
+) -> models.Distribution:
+    """为可整体承接的候补条目原子占额并生成一笔 approved 发行申请。
+
+    占用与直接申请共用同一护栏（``used + reserved < max`` 条件更新并
+    断言影响行数）；素材在候补内唯一，每个授权至多被占用一次。
+    """
+    for item in items:
+        auth = chosen[item.material_id]
+        result = db.execute(
+            update(models.Authorization)
+            .where(
+                models.Authorization.id == auth.id,
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                < models.Authorization.max_count,
+            )
+            .values(used_count=models.Authorization.used_count + 1)
+        )
+        if result.rowcount != 1:
+            db.rollback()
+            raise RuntimeError(
+                f"候补占额失败：授权 {auth.id} 余量不足（并发冲突）"
+            )
+    distribution = models.Distribution(
+        region=head.region,
+        channel=head.channel,
+        occur_at=head.occur_at,
+        status="approved",
+    )
+    db.add(distribution)
+    db.flush()
+    for item in items:
+        db.add(
+            models.DistributionItem(
+                distribution_id=distribution.id,
+                material_id=item.material_id,
+                authorization_id=chosen[item.material_id].id,
+                item_index=item.item_index,
+            )
+        )
+    db.flush()
+    return distribution
+
+
+def _process_waitlist(db: Session, region: str, channel: str) -> None:
+    """在通道咨询锁内按受理顺序（id 升序）重算本通道候补队列。
+
+    逐轮取队首重算（沿用现行匹配与重叠授权选择顺序）：
+
+    - 能整体承接：原子占额转为一笔 approved 申请，继续下一队首；
+    - 授权已不再匹配（任一项无匹配授权或匹配授权均已停用）：标记
+      ``failed`` 并记录逐项原因，继续下一队首；
+    - 额度仍不足（失败项全部为 ``quota_exhausted``）：停止本轮，
+      队首阻塞，后续条目留待下一触发。
+
+    调用方必须已持有本通道咨询锁并完成到期结算；本函数只读最新行锁
+    下的计数，占额经条件更新兜底，绝不超额、不重复生成申请。
+    """
+    while True:
+        head = db.scalar(
+            select(models.WaitlistRequest)
+            .where(
+                models.WaitlistRequest.region == region,
+                models.WaitlistRequest.channel == channel,
+                models.WaitlistRequest.status == "pending",
+            )
+            .order_by(models.WaitlistRequest.id.asc())
+            .limit(1)
+            .with_for_update()
+        )
+        if head is None:
+            return
+        items = list(
+            db.scalars(
+                select(models.WaitlistItem)
+                .where(models.WaitlistItem.waitlist_id == head.id)
+                .order_by(models.WaitlistItem.item_index.asc())
+            )
+        )
+        material_ids = [item.material_id for item in items]
+        candidate_ids = _candidate_auth_ids(
+            db, material_ids, region, channel, head.occur_at
+        )
+        locked_rows = _lock_authorizations(db, candidate_ids)
+        chosen, reasons = _evaluate(
+            material_ids,
+            locked_rows,
+            region=region,
+            channel=channel,
+            occur=head.occur_at,
+            for_reservation=False,
+        )
+        now = utcnow()
+        if not reasons:
+            distribution = _occupy_waitlist(db, head, items, chosen)
+            head.status = "fulfilled"
+            head.distribution_id = distribution.id
+            head.fulfilled_at = now
+            db.flush()
+            continue
+        if any(r["reason"] in _NO_MATCH_REASONS for r in reasons):
+            head.status = "failed"
+            head.failure_reason = "authorization_unavailable"
+            head.failure_details = reasons
+            head.failed_at = now
+            db.flush()
+            continue
+        # 每项均有匹配授权但额度仍不足：停止本轮。
+        return
+
+
 # ------------------------------------------------------- 发行核验与占用
 def create_distribution(
     db: Session, data: DistributionCreate
@@ -431,7 +596,7 @@ def create_distribution(
         candidate_ids = _candidate_auth_ids(
             db, material_ids, data.region, data.channel, occur
         )
-        locked_rows = _settle_expired(
+        _settle_expired(
             db,
             now,
             region=data.region,
@@ -439,7 +604,12 @@ def create_distribution(
             extra_auth_ids=candidate_ids,
         )
 
-        # 4) 逐项判定（未到期预留参与余量：used + reserved < max）。
+        # 4) 新直接申请须先处理可成交候补，不得抢走其额度；候补占额后
+        #    按 id 升序重取候选授权行（行锁保护下的最新计数）。
+        _process_waitlist(db, data.region, data.channel)
+        locked_rows = _lock_authorizations(db, candidate_ids)
+
+        # 5) 逐项判定（未到期预留参与余量：used + reserved < max）。
         chosen, reasons = _evaluate(
             material_ids,
             locked_rows,
@@ -449,10 +619,11 @@ def create_distribution(
             for_reservation=False,
         )
         if reasons:
-            db.rollback()
+            # 候补成交与到期结算的账目仍然提交；本次申请不占任何额度。
+            db.commit()
             raise DistributionRejected(reasons)
 
-        # 5) 条件占用正式次数（含预留占用护栏），断言影响行数。
+        # 6) 条件占用正式次数（含预留占用护栏），断言影响行数。
         for auth in chosen.values():
             result = db.execute(
                 update(models.Authorization)
@@ -479,7 +650,7 @@ def create_distribution(
                     ]
                 )
 
-        # 6) 落库申请及逐项占用记录。
+        # 7) 落库申请及逐项占用记录。
         distribution = models.Distribution(
             region=data.region,
             channel=data.channel,
@@ -605,6 +776,8 @@ def revoke_distribution(
 
         distribution.status = "revoked"
         distribution.revoked_at = datetime.now(timezone.utc)
+        # 撤销释放额度后，按受理顺序重算本通道候补队首（可成交者原子占额）。
+        _process_waitlist(db, region, channel)
         db.commit()
     except (ResourceNotFound, AlreadyRevoked):
         raise
@@ -684,7 +857,7 @@ def reschedule_distribution(
         candidate_ids = _candidate_auth_ids(
             db, material_ids, region, channel, data.occur_at
         )
-        locked_rows = _settle_expired(
+        locked_rows, _ = _settle_expired(
             db,
             utcnow(),
             region=region,
@@ -745,6 +918,8 @@ def reschedule_distribution(
             item.authorization_id = new_auth.id
 
         distribution.occur_at = data.occur_at
+        # 改期可能释放了原授权额度：按受理顺序重算本通道候补队首。
+        _process_waitlist(db, region, channel)
         db.commit()
     except (ResourceNotFound, DistributionRevoked, RescheduleRejected):
         raise
@@ -770,13 +945,18 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
         candidate_ids = _candidate_auth_ids(
             db, material_ids, data.region, data.channel, data.occur_at
         )
-        locked_rows = _settle_expired(
+        locked_rows, settled = _settle_expired(
             db,
             now,
             region=data.region,
             channel=data.channel,
             extra_auth_ids=candidate_ids,
         )
+        if settled:
+            # 到期释放额度后，先按受理顺序处理可成交候补，
+            # 再基于候补占额后的最新计数做本次预留判定。
+            _process_waitlist(db, data.region, data.channel)
+            locked_rows = _lock_authorizations(db, candidate_ids)
 
         # 沿用既有授权匹配与重叠选择顺序；未到期预留同样占额。
         chosen, reasons = _evaluate(
@@ -788,7 +968,8 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
             for_reservation=True,
         )
         if reasons:
-            db.rollback()
+            # 候补成交与到期结算的账目仍然提交；本次预留不占任何额度。
+            db.commit()
             raise ReservationRejected(reasons)
 
         reservation = models.Reservation(
@@ -948,7 +1129,10 @@ def get_reservation(db: Session, reservation_id: int) -> models.Reservation:
     region, channel = head
     try:
         _channel_lock(db, region, channel)
-        _settle_expired(db, utcnow(), region=region, channel=channel)
+        _, settled = _settle_expired(db, utcnow(), region=region, channel=channel)
+        if settled:
+            # 到期释放额度后，按受理顺序重算本通道候补队首。
+            _process_waitlist(db, region, channel)
         db.commit()
     except Exception:
         db.rollback()
@@ -991,13 +1175,17 @@ def confirm_reservation(
                 .where(models.Reservation.id == reservation_id)
             )
         )
-        _settle_expired(
+        _, settled = _settle_expired(
             db,
             utcnow(),
             region=region,
             channel=channel,
             extra_auth_ids=item_auth_ids,
         )
+        if settled:
+            # 到期释放额度后，先处理可成交候补（本预留的槽位由
+            # reserved_count 保护，确认转账不受候补占额影响）。
+            _process_waitlist(db, region, channel)
 
         resv = _load_reservation(db, reservation_id, for_update=True)
 
@@ -1161,6 +1349,8 @@ def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
 
         resv.status = "cancelled"
         resv.cancelled_at = utcnow()
+        # 取消释放预留额度后，按受理顺序重算本通道候补队首。
+        _process_waitlist(db, region, channel)
         db.commit()
     except (
         ResourceNotFound,
@@ -1249,7 +1439,7 @@ def migrate_authorization(
         # 2) 第一加锁点：通道咨询锁；随后立即结算本通道到期预留
         #    （归还 reserved_count），再锁定两端授权行。
         _channel_lock(db, source.region, source.channel)
-        locked_rows = _settle_expired(
+        locked_rows, _ = _settle_expired(
             db,
             utcnow(),
             region=source.region,
@@ -1411,6 +1601,12 @@ def migrate_authorization(
                 )
 
         source.status = "inactive"
+        # 先落库停用状态：随后重算候补时 populate_existing 会以库内值
+        # 刷新授权对象，未 flush 的待提交变更会被丢弃。
+        db.flush()
+        # 改挂释放（并停用）原授权后重算候补队首：仍匹配启用授权且额度
+        # 足够者成交；仅匹配原授权者因「授权已不再匹配」标记失败。
+        _process_waitlist(db, source.region, source.channel)
         db.commit()
     except MigrationRejected:
         db.rollback()
@@ -1426,3 +1622,224 @@ def migrate_authorization(
         "source_authorization": source,
         "replacement_authorization": target,
     }
+
+
+# ================================================================= 候补
+def create_waitlist(db: Session, data: WaitlistCreate) -> models.WaitlistRequest:
+    """提交候补申请（素材清单/地区/渠道/带时区发行时刻）。
+
+    受理判定（沿用现行授权匹配与重叠选择顺序）：
+
+    - **全部可承接**：原子占额，直接生成已通过申请
+      （``status=fulfilled``，随附 ``distribution_id``）；
+    - **每项均有匹配授权但额度不足**：进入本通道候补队列
+      （``status=pending``，不占任何额度，按受理顺序等待重算）；
+    - **任一项缺少匹配授权**（无匹配，或匹配授权均已停用）：整体拒绝
+      （422 ``waitlist_rejected``，逐项列明原因，不入队、不占额）。
+
+    受理前先在通道咨询锁内处理本通道可成交候补（含到期结算释放的
+    额度），新候补不抢既有候补的额度。
+    """
+    material_ids = list(data.material_ids)
+    _validate_material_ids(db, material_ids)
+
+    try:
+        _channel_lock(db, data.region, data.channel)
+        now = utcnow()
+        candidate_ids = _candidate_auth_ids(
+            db, material_ids, data.region, data.channel, data.occur_at
+        )
+        _settle_expired(
+            db,
+            now,
+            region=data.region,
+            channel=data.channel,
+            extra_auth_ids=candidate_ids,
+        )
+        # 先处理可成交候补，再基于其占额后的最新计数判定本次受理。
+        _process_waitlist(db, data.region, data.channel)
+        locked_rows = _lock_authorizations(db, candidate_ids)
+        chosen, reasons = _evaluate(
+            material_ids,
+            locked_rows,
+            region=data.region,
+            channel=data.channel,
+            occur=data.occur_at,
+            for_reservation=False,
+        )
+        if reasons and any(
+            r["reason"] in _NO_MATCH_REASONS for r in reasons
+        ):
+            # 缺少匹配授权：逐项拒绝。候补成交与到期结算的账目仍提交。
+            db.commit()
+            raise WaitlistRejected(reasons)
+
+        entry = models.WaitlistRequest(
+            region=data.region,
+            channel=data.channel,
+            occur_at=data.occur_at,
+            status="pending",
+        )
+        db.add(entry)
+        db.flush()
+        items: list[models.WaitlistItem] = []
+        for index, mid in enumerate(material_ids):
+            item = models.WaitlistItem(
+                waitlist_id=entry.id, material_id=mid, item_index=index
+            )
+            db.add(item)
+            items.append(item)
+        db.flush()
+
+        if not reasons:
+            # 全部可承接：原子占额，直接生成已通过申请。
+            distribution = _occupy_waitlist(db, entry, items, chosen)
+            entry.status = "fulfilled"
+            entry.distribution_id = distribution.id
+            entry.fulfilled_at = now
+        db.commit()
+    except WaitlistRejected:
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    return _load_waitlist(db, entry.id)
+
+
+def _load_waitlist(
+    db: Session, waitlist_id: int, *, for_update: bool = False
+) -> models.WaitlistRequest:
+    # 成交事务内把同事务新建的 distribution 赋给本候补后，关系缓存可能为
+    # None；一律使会话已加载状态过期，保证下面 selectinload 真正载入新关系。
+    db.expire_all()
+    stmt = (
+        select(models.WaitlistRequest)
+        .where(models.WaitlistRequest.id == waitlist_id)
+        .options(
+            selectinload(models.WaitlistRequest.items),
+            selectinload(models.WaitlistRequest.distribution)
+            .selectinload(models.Distribution.items)
+            .selectinload(models.DistributionItem.material),
+            selectinload(models.WaitlistRequest.distribution)
+            .selectinload(models.Distribution.items)
+            .selectinload(models.DistributionItem.authorization),
+        )
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    entry = db.scalar(stmt)
+    if entry is None:
+        raise ResourceNotFound("候补申请", waitlist_id)
+    return entry
+
+
+def get_waitlist(db: Session, waitlist_id: int) -> models.WaitlistRequest:
+    """查询候补（状态、失败原因、生成的申请编号）。
+
+    查询前在本通道内做到期结算并重算候补队首，因此返回的是触发
+    「到期即释放 → 重算」之后的最新状态。
+    """
+    head = db.execute(
+        select(
+            models.WaitlistRequest.region,
+            models.WaitlistRequest.channel,
+        ).where(models.WaitlistRequest.id == waitlist_id)
+    ).first()
+    if head is None:
+        raise ResourceNotFound("候补申请", waitlist_id)
+    region, channel = head
+    try:
+        _channel_lock(db, region, channel)
+        _, settled = _settle_expired(db, utcnow(), region=region, channel=channel)
+        if settled:
+            # 到期释放额度后，按受理顺序重算本通道候补队首。
+            _process_waitlist(db, region, channel)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return _load_waitlist(db, waitlist_id)
+
+
+def list_waitlists(
+    db: Session, status: str | None
+) -> list[models.WaitlistRequest]:
+    """查询候补列表，可按状态过滤（pending/fulfilled/failed/cancelled）。"""
+    if status is not None and status not in (
+        "pending",
+        "fulfilled",
+        "failed",
+        "cancelled",
+    ):
+        raise InvalidWaitlistStatus(status)
+
+    stmt = (
+        select(models.WaitlistRequest)
+        .options(
+            selectinload(models.WaitlistRequest.items),
+            selectinload(models.WaitlistRequest.distribution)
+            .selectinload(models.Distribution.items)
+            .selectinload(models.DistributionItem.material),
+            selectinload(models.WaitlistRequest.distribution)
+            .selectinload(models.Distribution.items)
+            .selectinload(models.DistributionItem.authorization),
+        )
+        .order_by(models.WaitlistRequest.id.asc())
+    )
+    if status is not None:
+        stmt = stmt.where(models.WaitlistRequest.status == status)
+    return list(db.scalars(stmt))
+
+
+def cancel_waitlist(db: Session, waitlist_id: int) -> models.WaitlistRequest:
+    """取消待处理候补（仅 pending 可取消，仅生效一次）。
+
+    已成交候补不可取消：其生成的发行申请沿用现有撤销规则
+    （``POST /distributions/{id}/revoke``）。取消后队首前移，
+    立即重算本通道候补队列。
+    """
+    head = db.execute(
+        select(
+            models.WaitlistRequest.region,
+            models.WaitlistRequest.channel,
+        ).where(models.WaitlistRequest.id == waitlist_id)
+    ).first()
+    if head is None:
+        raise ResourceNotFound("候补申请", waitlist_id)
+    region, channel = head
+
+    try:
+        _channel_lock(db, region, channel)
+        _settle_expired(db, utcnow(), region=region, channel=channel)
+
+        entry = db.scalar(
+            select(models.WaitlistRequest)
+            .where(models.WaitlistRequest.id == waitlist_id)
+            .with_for_update()
+        )
+        if entry.status == "fulfilled":
+            raise WaitlistAlreadyFulfilled(waitlist_id, entry.distribution_id)
+        if entry.status == "cancelled":
+            raise WaitlistAlreadyCancelled(waitlist_id)
+        if entry.status == "failed":
+            raise WaitlistAlreadyFailed(waitlist_id)
+
+        entry.status = "cancelled"
+        entry.cancelled_at = utcnow()
+        db.flush()
+        # 队首移除后，后续候补可能具备承接条件：重算本通道队列。
+        _process_waitlist(db, region, channel)
+        db.commit()
+    except (
+        ResourceNotFound,
+        WaitlistAlreadyFulfilled,
+        WaitlistAlreadyCancelled,
+        WaitlistAlreadyFailed,
+    ):
+        raise
+    except Exception:
+        db.rollback()
+        raise
+
+    return _load_waitlist(db, waitlist_id)

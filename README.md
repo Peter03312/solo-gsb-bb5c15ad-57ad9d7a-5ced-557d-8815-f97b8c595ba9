@@ -1,9 +1,9 @@
 # 素材发行授权核验 HTTP API
 
-为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，并支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期）。
+为内容团队构建的素材发行授权核验服务：登记素材及其发行授权（**地区、渠道、带时区的左闭右开时段、可发行次数**），对携带多个素材的发行申请做**整体核验、原子占用**，支持已通过申请的查询、**一次性撤销（释放占用）**、**改期（更换发行时刻并原子重选授权）**、授权退役时的**一次性改挂**，支持发行前的**额度预留**（1～30 分钟有效期，待确认/确认/取消/过期全生命周期），并支持**候补申请**：额度暂不足时进入通道候补队列按受理顺序等待，额度释放后自动重算、原子占额转为已通过申请。
 
 - 技术栈：Python 3.11 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Pydantic v2
-- 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放**
+- 并发安全：数据库行锁 + 通道咨询锁 + 条件更新三重保障，**高并发下绝不超额、不重复释放、候补不重复成交**
 - 一键启动：`docker compose up`，自动等待数据库就绪并初始化表结构（旧库启动时幂等补齐预留字段，无需手工迁移）
 
 ---
@@ -88,6 +88,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/reservations/{id}` | 查询单个预留（读取时惰性结算到期状态） |
 | `POST` | `/reservations/{id}/confirm` | **到期前确认：原子转为一笔已通过申请**（重复确认返回同一笔） |
 | `POST` | `/reservations/{id}/cancel` | **取消预留**（与确认互斥，仅生效一次，释放预留额度） |
+| `POST` | `/waitlists` | **提交候补申请：全部可承接直接成交；仅额度不足入候补队列；缺少匹配授权逐项拒绝** |
+| `GET` | `/waitlists` | 查询候补列表（`?status=pending/fulfilled/failed/cancelled` 过滤） |
+| `GET` | `/waitlists/{id}` | 查询候补（状态、失败原因及生成的申请编号） |
+| `POST` | `/waitlists/{id}/cancel` | **取消待处理候补**（仅候补中可取消；已成交申请走撤销规则） |
 
 ### 核验与占用规则
 
@@ -200,6 +204,52 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 7. 预留的地区/渠道/发行时刻在创建时确定；确认生成的申请**归属预留时
    命中的同一授权**，发行时刻沿用预留的 `occur_at`。
 
+### 候补申请规则
+
+发行团队可用**素材编号列表、地区、渠道与带时区发行时刻**提交候补申请
+（`POST /waitlists`，入参与发行申请相同）。受理时**先沿用现有匹配及
+授权选择规则**（素材/地区/渠道/左闭右开时段匹配；重叠授权按到期早
+优先、其次编号小；未到期预留占额），按三项判定分流：
+
+1. **全部可承接**：原子占额，**直接生成已通过申请**——候补记录
+   `status=fulfilled` 并随附 `distribution_id` 与内嵌申请（201）。
+2. **每项均有匹配授权但额度不足**（失败项全部为 `quota_exhausted`）：
+   进入**本通道（region+channel）候补队列**，`status=pending`，
+   **不占任何额度**（201）。
+3. **任一项缺少匹配授权**（无匹配授权，或匹配授权均已停用）：整体
+   拒绝（422 `waitlist_rejected`），逐项列明原因，**不入队、不占额**。
+
+**队列处理（按受理顺序，id 升序）**：撤销、预留取消或到期、改期、
+改挂**释放额度后**，以及新直接申请/新候补受理前，都会在通道咨询锁内
+重算队首：
+
+- **能整体承接**：原子占额转为**一笔已通过申请**（`fulfilled`，
+  记录 `distribution_id` 与 `fulfilled_at`），继续下一队首；
+- **额度仍不足**（失败项全部为 `quota_exhausted`）：**停止本轮**——
+  队首阻塞，后续条目留待下一触发，不越序成交；
+- **授权已不再匹配**（任一项无匹配授权或匹配授权均已停用，如授权被
+  停用、改挂后替代授权时段不覆盖该候补的发行时刻）：标记
+  `failed`（记录 `failure_reason=authorization_unavailable` 与逐项
+  明细 `failure_details`、`failed_at`），**继续后项**。
+
+**新直接申请**（`POST /distributions`）与**新候补受理**都会**先处理
+可成交候补**，再判定自身——**不得抢走可成交候补的额度**；若候补成交
+后余量不足，直接申请按既有规则整体拒绝（候补成交结果仍然生效）。
+登记/启用新授权本身不触发重算，容量变化在下一触发点生效。
+
+**查询与取消**：
+
+- `GET /waitlists/{id}` 返回候补状态、失败原因（`failure_reason` /
+  `failure_details`）及生成的申请编号（`distribution_id`，成交时内嵌
+  完整申请）；`GET /waitlists?status=...` 按四态过滤。
+- **待处理候补可取消**（`POST /waitlists/{id}/cancel`，仅生效一次）；
+  取消队首后后续候补立即重算。已成交/已失败/已取消的候补不可取消
+  （409）。
+- **已转申请沿用现有撤销规则**：成交生成的申请就是普通 `approved`
+  申请，可经 `GET /distributions/{id}` 查询、`POST
+  /distributions/{id}/revoke` 撤销（释放额度并再次触发队首重算）、
+  改期与参与改挂；候补记录保持 `fulfilled` 并关联该申请。
+
 ### 错误响应格式
 
 所有业务错误统一为：
@@ -231,6 +281,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 422 | `reschedule_rejected` | 改期核验未通过；`details` 按项列明原因（见下），原记录与次数均不变 |
 | 422 | `reservation_rejected` | 预留核验未通过；`details` 按项列明原因（见下），不占任何额度 |
 | 422 | `migration_rejected` | 授权改挂核验未通过；`details` 列明原因（见下），归属与次数均不变 |
+| 422 | `waitlist_rejected` | 候补受理核验未通过（存在缺少匹配授权的素材）；`details` 按项列明原因，不入队 |
 | 409 | `already_revoked` | 对已撤销申请重复撤销 |
 | 409 | `distribution_revoked` | 对已撤销申请改期 |
 | 409 | `reservation_already_confirmed` | 对已确认预留执行取消 |
@@ -238,10 +289,14 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 409 | `reservation_cancelled` | 已取消预留之后再确认 |
 | 409 | `reservation_expired` | 到期时刻（含）之后确认，或对已过期预留取消 |
 | 422 | `invalid_reservation_status` | 预留列表使用了不支持的状态过滤值 |
-| 404 | `not_found` | 路径中的素材/授权/申请/预留编号不存在（改挂时原/替代授权任一不存在） |
+| 409 | `waitlist_already_fulfilled` | 对已成交候补执行取消（应改用申请撤销） |
+| 409 | `waitlist_already_cancelled` | 重复取消已取消候补 |
+| 409 | `waitlist_already_failed` | 对已失败（授权不再匹配）候补执行取消 |
+| 422 | `invalid_waitlist_status` | 候补列表使用了不支持的状态过滤值 |
+| 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在） |
 
 `distribution_rejected` / `reschedule_rejected` / `reservation_rejected`
-的逐项原因 `reason`：
+/ `waitlist_rejected` 的逐项原因 `reason`：
 
 - `no_matching_authorization`：没有同时匹配地区、渠道与发行时刻的授权
 - `authorization_inactive`：匹配的授权均已停用（停用只影响新申请/新预留/改期重选）
@@ -407,6 +462,75 @@ curl -s -X POST http://localhost:8000/api/v1/reservations/1/cancel
 curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
 ```
 
+### 候补操作示例（curl）
+
+```bash
+# 前提：授权 1（素材 1 / CN / web / max_count=1）已被申请 1 占满
+# 17) 提交候补申请：额度不足 → 入候补队列（201，status=pending，不占额）
+curl -s -X POST http://localhost:8000/api/v1/waitlists \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "material_ids": [1],
+    "region": "CN",
+    "channel": "web",
+    "occur_at": "2026-10-04T15:30:00+08:00"
+  }'
+# 201：{"id": 1, "status": "pending", "distribution_id": null, ...}
+# 若全部可承接：status=fulfilled 并随附生成的申请（distribution_id/内嵌申请）
+# 若缺少匹配授权：422 waitlist_rejected，details 逐项列明原因，不入队
+
+# 18) 撤销占用中的申请 → 释放额度 → 队首候补自动成交转为一笔申请
+curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
+curl -s http://localhost:8000/api/v1/waitlists/1
+# {"id": 1, "status": "fulfilled", "distribution_id": 2,
+#  "fulfilled_at": "...", "distribution": {... "status": "approved" ...}, ...}
+
+# 19) 查询候补列表（按状态过滤：pending/fulfilled/failed/cancelled）
+curl -s "http://localhost:8000/api/v1/waitlists?status=pending"
+
+# 20) 取消待处理候补（仅 pending 可取消，仅生效一次）
+curl -s -X POST http://localhost:8000/api/v1/waitlists/1/cancel
+# 200：status=cancelled；重复取消 -> 409 waitlist_already_cancelled
+# 已成交 -> 409 waitlist_already_fulfilled（改用 /distributions/{id}/revoke）
+# 已失败 -> 409 waitlist_already_failed
+
+# 21) 授权不再匹配（如匹配授权被停用/改挂后不覆盖）时，下一触发点
+#     重算会把队首标记失败并继续后项：
+curl -s -X PATCH http://localhost:8000/api/v1/authorizations/1 \
+  -H 'Content-Type: application/json' -d '{"status": "inactive"}'
+curl -s -X POST http://localhost:8000/api/v1/distributions/2/revoke  # 任一释放触发
+curl -s http://localhost:8000/api/v1/waitlists/1
+# {"status": "failed", "failure_reason": "authorization_unavailable",
+#  "failure_details": [{"item_index": 0, "material_id": 1,
+#                       "reason": "authorization_inactive", ...}], ...}
+
+# 22) 成交后的申请就是普通 approved 申请：可查询、撤销（释放后触发
+#     下一候补成交）、改期、参与改挂
+curl -s http://localhost:8000/api/v1/distributions/2
+curl -s -X POST http://localhost:8000/api/v1/distributions/2/revoke
+```
+
+候补入队（`pending`）响应示例：
+
+```json
+{
+  "id": 1,
+  "region": "CN",
+  "channel": "web",
+  "occur_at": "2026-10-04T15:30:00+08:00",
+  "status": "pending",
+  "failure_reason": null,
+  "failure_details": null,
+  "distribution_id": null,
+  "distribution": null,
+  "created_at": "2026-10-04T07:35:00Z",
+  "fulfilled_at": null,
+  "failed_at": null,
+  "cancelled_at": null,
+  "items": [{"item_index": 0, "material_id": 1}]
+}
+```
+
 预留成功响应示例（注意授权对象新增的 `reserved_count` 与
 `reservable_remaining`；正式占用字段 `used_count`/`remaining` 语义不变）：
 
@@ -484,15 +608,17 @@ curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
 ```
 通道咨询锁 pg_advisory_xact_lock(region+channel)
         → 到期预留惰性结算（reservations / authorizations）
-        → 预留/申请行锁（id 升序）
+        → 候补队首重算（waitlist_requests，释放/受理触发点）
+        → 预留/申请/候补行锁（id 升序）
         → 授权行锁（authorizations，id 升序）
         → 明细行锁（distribution/reservation_items，id 升序）
 ```
 
 1. **通道咨询锁 `pg_advisory_xact_lock`**：按 `region+channel` 分桶，
-   同一通道内的提交、预留、确认、取消、撤销、改期、改挂由此串行判定，消除
-   「各自读到有余量、先后扣减导致超额」以及「确认/取消/改期/改挂交错读到
-   一半旧状态」的竞态；事务提交/回滚时自动释放（同事务内重入同把锁安全）。
+   同一通道内的提交、预留、确认、取消、撤销、改期、改挂、候补受理与
+   队首重算由此串行判定，消除「各自读到有余量、先后扣减导致超额」
+   以及「确认/取消/改期/改挂/候补成交交错读到一半旧状态」的竞态；
+   事务提交/回滚时自动释放（同事务内重入同把锁安全）。
    授权行只会被同通道事务竞争（匹配维度即 region+channel，改挂也要求
    两端通道一致），因此不同通道不争用同一授权行，跨桶不可能成等待环。
 2. **到期惰性结算**：拿到通道咨询锁后、业务判定之前，事务先把本通道
@@ -501,19 +627,23 @@ curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
    `reserved_count` 并把预留置为 `expired`。因此到期预留对随后的提交/
    预留余量判定立即可见（**到期即释放**），且到期释放与确认/取消在同
    通道内天然互斥，不会重复释放。无需后台定时任务。
-3. **行锁 `SELECT ... FOR UPDATE`**：预留/申请行锁串行化对同一对象的
-   并发确认与取消（恰为一方 200、一方 409）、并发双重确认（均 200 但
-   只生成一笔申请）、并发双重取消（恰为一次 200、一次 409）、并发撤销与
-   改期（撤销必先于改期生效，否则改期看到 `revoked` 拒绝）；授权行
-   始终按 `id` 全局升序加锁；改挂、撤销与改期还锁定相关**明细行**，固定
+3. **候补队首重算**：撤销、预留取消/到期、改期、改挂释放额度后，以及
+   新直接申请/新候补受理前，事务在咨询锁内按受理顺序重算本通道候补
+   队首：队首行 `FOR UPDATE` 锁定，能整体承接则条件占额并生成一笔
+   申请（`fulfilled`），额度不足则停止本轮，授权不再匹配则标记
+   `failed` 并继续后项。全部在同一事务内随触发操作一并提交，**并发
+   释放与受理不会重复生成申请、不会超额**。
+4. **行锁 `SELECT ... FOR UPDATE`**：预留/申请/候补行锁串行化对同一
+   对象的并发操作（确认/取消、撤销/改期、候补成交/取消）；授权行始终
+   按 `id` 全局升序加锁；改挂、撤销与改期还锁定相关**明细行**，固定
    「明细 → 授权」归属。
-4. **条件更新**：正式占用 `used+reserved < max`、预留占用
+5. **条件更新**：正式占用 `used+reserved < max`、预留占用
    `used+reserved < max`、确认转账（`reserved >= 1` 再
    `used+reserved < max`）、取消/到期释放 `reserved >= n`、
    改挂迁入 `used+reserved <= max-n` / 迁出 `used >= n`、
    撤销释放 `used >= 1`、改期搬移「原授权 `used >= 1` 再新授权
-   `used+reserved < max`」，全部断言影响行数，作为超额/重复释放的
-   最后防线。
+   `used+reserved < max`」、候补成交占额 `used+reserved < max`，
+   全部断言影响行数，作为超额/重复释放的最后防线。
 
 核验/预留/改期/改挂不通过即 `ROLLBACK`，不产生任何次数或归属变化。任意时刻
 都有不变量：
@@ -556,6 +686,13 @@ curl -s -X POST http://localhost:8000/api/v1/distributions/1/revoke
   **改挂与新预留并发**、到期释放与逾期确认/新申请竞争、多素材并发预留），
   断言绝不超额、不重复释放且
   `used_count`/`reserved_count` 与有效明细账实相符。
+- `tests/test_waitlist.py`：118 项候补端到端用例，覆盖受理三分支（全部
+  可承接直接成交/仅额度不足入队/缺少匹配授权逐项拒绝）、重叠授权选择
+  顺序、撤销/预留取消/预留到期/改期/改挂触发的队首重算、受理顺序
+  FIFO、队首额度不足停止本轮（不越序）、授权不再匹配标记失败并继续
+  后项、新直接申请不抢可成交候补额度、查询四态与过滤、取消四态冲突、
+  取消队首后后续重算、已转申请沿用撤销/改期规则，以及并发受理、
+  并发释放与受理、多触发源并发重算下的不超额/不重复生成/账实相符。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -567,6 +704,7 @@ python3 -m tests.test_reservation_api
 python3 -m tests.test_reschedule
 python3 -m tests.test_concurrency
 python3 -m tests.test_reservations
+python3 -m tests.test_waitlist
 ```
 
 > 测试会先 `DROP` 再重建全部表，请勿指向含生产数据的数据库。
@@ -585,16 +723,17 @@ python3 -m tests.test_reservations
 │   ├── config.py      # 环境变量配置（含预留 TTL 1～30 范围）
 │   ├── database.py    # 引擎/会话/启动建表（旧库幂等补齐 reserved_count）
 │   ├── models.py      # Material / Authorization / Distribution(+Item) /
-│   │                  # Reservation(+Item)
+│   │                  # Reservation(+Item) / WaitlistRequest(+Item)
 │   ├── schemas.py     # 请求响应模型与时段/时区/TTL 校验
-│   ├── errors.py      # 业务错误码（含预留四态冲突码与改期拒绝码）
+│   ├── errors.py      # 业务错误码（含预留四态冲突码、改期拒绝码与候补状态码）
 │   └── services.py    # 核验占用 / 预留 / 确认 / 取消 / 到期结算 /
-│                      # 撤销 / 改期 / 改挂（核心事务逻辑）
+│                      # 撤销 / 改期 / 改挂 / 候补受理与队首重算（核心事务逻辑）
 └── tests/
     ├── test_api.py
     ├── test_migrate.py
     ├── test_reservation_api.py
     ├── test_reschedule.py
     ├── test_reservations.py
-    └── test_concurrency.py
+    ├── test_concurrency.py
+    └── test_waitlist.py
 ```

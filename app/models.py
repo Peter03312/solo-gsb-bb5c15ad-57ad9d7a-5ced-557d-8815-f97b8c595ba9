@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     DateTime,
 )
@@ -254,3 +255,91 @@ class ReservationItem(Base):
     reservation: Mapped["Reservation"] = relationship(back_populates="items")
     material: Mapped["Material"] = relationship()
     authorization: Mapped["Authorization"] = relationship()
+
+
+class WaitlistRequest(Base):
+    """一次候补申请：每项均有匹配授权但额度不足时进入通道候补队列。
+
+    生命周期状态：
+
+    - ``pending``   候补中（不占任何额度，按受理顺序等待重算）
+    - ``fulfilled`` 已成交（已原子占额并转为一笔 approved 发行申请）
+    - ``failed``    已失败（重算时授权已不再匹配：无匹配或均已停用）
+    - ``cancelled`` 已取消（仅 pending 可取消，仅生效一次）
+
+    候补条目**不持有额度**：提交时全部可承接则直接生成已通过申请；
+    仅额度不足才入队。撤销、预留取消/到期、改期、改挂释放额度后，
+    以及新直接申请/新候补受理时，都会在通道咨询锁内按受理顺序
+    （id 升序）重算队首：能整体承接则原子占额转申请并继续；额度仍
+    不足则停止本轮（队首阻塞）；授权已不再匹配则标记失败并继续后项。
+    """
+
+    __tablename__ = "waitlist_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'fulfilled', 'failed', 'cancelled')",
+            name="ck_wait_status",
+        ),
+        CheckConstraint(
+            "(status = 'fulfilled') = (distribution_id IS NOT NULL)",
+            name="ck_wait_distribution",
+        ),
+        Index("ix_wait_channel_queue", "region", "channel", "status", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    region: Mapped[str] = mapped_column(String(64), nullable=False)
+    channel: Mapped[str] = mapped_column(String(64), nullable=False)
+    occur_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", nullable=False
+    )
+    # 失败原因（机器可读码）与逐项明细（与拒绝响应 details 同构）。
+    failure_reason: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    failure_details: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # 成交后指向由本候补生成的那笔 approved 申请。
+    distribution_id: Mapped[int | None] = mapped_column(
+        ForeignKey("distributions.id", ondelete="RESTRICT"), nullable=True
+    )
+    fulfilled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    failed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+    items: Mapped[list["WaitlistItem"]] = relationship(
+        back_populates="waitlist",
+        cascade="all, delete-orphan",
+        order_by="WaitlistItem.id",
+    )
+    distribution: Mapped["Distribution | None"] = relationship()
+
+
+class WaitlistItem(Base):
+    """候补中的每个素材（不锁定授权：成交重算时按现行规则重选授权）。"""
+
+    __tablename__ = "waitlist_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    waitlist_id: Mapped[int] = mapped_column(
+        ForeignKey("waitlist_requests.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    material_id: Mapped[int] = mapped_column(
+        ForeignKey("materials.id", ondelete="RESTRICT"), nullable=False
+    )
+    item_index: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    waitlist: Mapped["WaitlistRequest"] = relationship(back_populates="items")
+    material: Mapped["Material"] = relationship()
