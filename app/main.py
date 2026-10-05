@@ -1,0 +1,230 @@
+"""FastAPI 应用入口与 HTTP 路由。"""
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from app import schemas, services
+from app.database import get_db, init_db
+from app.errors import APIError
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # docker compose up 后自动建表，无需手工迁移。
+    init_db()
+    yield
+
+
+app = FastAPI(
+    title="素材发行授权核验 API",
+    version="1.3.0",
+    description=(
+        "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
+        "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
+        "已通过申请的改期（原子重选授权）、"
+        "授权退役时将未撤销申请一次性改挂到替代授权；"
+        "并支持 1～30 分钟有效期的发行额度预留（待确认/确认/取消/过期）。"
+    ),
+    lifespan=lifespan,
+)
+
+
+@app.exception_handler(APIError)
+async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "details": exc.details or [],
+            }
+        },
+    )
+
+
+@app.get("/health", tags=["system"])
+def health() -> dict:
+    return {"status": "ok"}
+
+
+# ------------------------------------------------------------------ 素材
+@app.post(
+    "/api/v1/materials",
+    response_model=schemas.MaterialOut,
+    status_code=201,
+    tags=["materials"],
+)
+def create_material(
+    body: schemas.MaterialCreate, db: Session = Depends(get_db)
+):
+    return services.create_material(db, body)
+
+
+@app.get(
+    "/api/v1/materials/{material_id}",
+    response_model=schemas.MaterialOut,
+    tags=["materials"],
+)
+def get_material(material_id: int, db: Session = Depends(get_db)):
+    return services.get_material(db, material_id)
+
+
+# ------------------------------------------------------------------ 授权
+@app.post(
+    "/api/v1/authorizations",
+    response_model=schemas.AuthorizationOut,
+    status_code=201,
+    tags=["authorizations"],
+)
+def create_authorization(
+    body: schemas.AuthorizationCreate, db: Session = Depends(get_db)
+):
+    return services.create_authorization(db, body)
+
+
+@app.get(
+    "/api/v1/authorizations/{authorization_id}",
+    response_model=schemas.AuthorizationOut,
+    tags=["authorizations"],
+)
+def get_authorization(authorization_id: int, db: Session = Depends(get_db)):
+    return services.get_authorization(db, authorization_id)
+
+
+@app.patch(
+    "/api/v1/authorizations/{authorization_id}",
+    response_model=schemas.AuthorizationOut,
+    tags=["authorizations"],
+)
+def update_authorization(
+    authorization_id: int,
+    body: schemas.AuthorizationUpdate,
+    db: Session = Depends(get_db),
+):
+    return services.set_authorization_status(
+        db, authorization_id, body.status
+    )
+
+
+@app.post(
+    "/api/v1/authorizations/migrate",
+    response_model=schemas.AuthorizationMigrationOut,
+    tags=["authorizations"],
+    summary="授权退役改挂：原授权承载的全部未撤销申请一次性改挂到替代授权",
+)
+def migrate_authorization(
+    body: schemas.AuthorizationMigrationRequest,
+    db: Session = Depends(get_db),
+):
+    return services.migrate_authorization(db, body)
+
+
+# ------------------------------------------------------------------ 发行
+@app.post(
+    "/api/v1/distributions",
+    response_model=schemas.DistributionOut,
+    status_code=201,
+    tags=["distributions"],
+    summary="提交发行申请：整体核验并原子占用次数",
+)
+def create_distribution(
+    body: schemas.DistributionCreate, db: Session = Depends(get_db)
+):
+    return services.create_distribution(db, body)
+
+
+@app.get(
+    "/api/v1/distributions/{distribution_id}",
+    response_model=schemas.DistributionOut,
+    tags=["distributions"],
+)
+def get_distribution(distribution_id: int, db: Session = Depends(get_db)):
+    return services.get_distribution(db, distribution_id)
+
+
+@app.post(
+    "/api/v1/distributions/{distribution_id}/revoke",
+    response_model=schemas.DistributionOut,
+    tags=["distributions"],
+    summary="撤销发行申请（仅可撤销一次，释放占用次数）",
+)
+def revoke_distribution(
+    distribution_id: int, db: Session = Depends(get_db)
+):
+    return services.revoke_distribution(db, distribution_id)
+
+
+@app.post(
+    "/api/v1/distributions/{distribution_id}/reschedule",
+    response_model=schemas.DistributionOut,
+    tags=["distributions"],
+    summary="改期：以新的带时区发行时刻调整已通过申请的档期（原子重选授权）",
+)
+def reschedule_distribution(
+    distribution_id: int,
+    body: schemas.DistributionReschedule,
+    db: Session = Depends(get_db),
+):
+    return services.reschedule_distribution(db, distribution_id, body)
+
+
+# ------------------------------------------------------------------ 预留
+@app.post(
+    "/api/v1/reservations",
+    response_model=schemas.ReservationOut,
+    status_code=201,
+    tags=["reservations"],
+    summary="预留发行额度：全部素材同时通过才生成预留编号并逐项占额",
+)
+def create_reservation(
+    body: schemas.ReservationCreate, db: Session = Depends(get_db)
+):
+    return services.create_reservation(db, body)
+
+
+@app.get(
+    "/api/v1/reservations",
+    response_model=list[schemas.ReservationOut],
+    tags=["reservations"],
+    summary="查询预留列表（可按 status 过滤：待确认/已确认/已取消/已过期）",
+)
+def list_reservations(
+    status: str | None = None, db: Session = Depends(get_db)
+):
+    return services.list_reservations(db, status)
+
+
+@app.get(
+    "/api/v1/reservations/{reservation_id}",
+    response_model=schemas.ReservationOut,
+    tags=["reservations"],
+)
+def get_reservation(reservation_id: int, db: Session = Depends(get_db)):
+    return services.get_reservation(db, reservation_id)
+
+
+@app.post(
+    "/api/v1/reservations/{reservation_id}/confirm",
+    response_model=schemas.ReservationOut,
+    tags=["reservations"],
+    summary="到期前确认：原子转为一笔已通过申请（重复确认返回同一笔）",
+)
+def confirm_reservation(
+    reservation_id: int, db: Session = Depends(get_db)
+):
+    return services.confirm_reservation(db, reservation_id)
+
+
+@app.post(
+    "/api/v1/reservations/{reservation_id}/cancel",
+    response_model=schemas.ReservationOut,
+    tags=["reservations"],
+    summary="取消预留（与确认互斥，仅生效一次，释放预留额度）",
+)
+def cancel_reservation(
+    reservation_id: int, db: Session = Depends(get_db)
+):
+    return services.cancel_reservation(db, reservation_id)
